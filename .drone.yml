@@ -1,0 +1,16 @@
+pipeline:
+  build:
+    image: centos:7.4.1708
+    commands:
+      - yum install -y rpm-build make yum-utils
+      - yum-builddep samba
+      - ./localbuild -bb samba.spec
+  github_release:
+    image: plugins/github-release
+    files:
+      - "*.rpm"
+    checksum:
+      - md5
+    secrets: [github_token]
+    when:
+       event: [tag]

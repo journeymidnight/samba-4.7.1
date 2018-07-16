@@ -1,0 +1,626 @@
+Index: samba-4.7.1/source3/modules/vfs_ceph.c
+===================================================================
+--- samba-4.7.1.orig/source3/modules/vfs_ceph.c
++++ samba-4.7.1/source3/modules/vfs_ceph.c
+@@ -36,9 +36,11 @@
+ #include <sys/statvfs.h>
+ #include "cephfs/libcephfs.h"
+ #include "smbprofile.h"
++#include "smbd/globals.h"
+ #include "modules/posixacl_xattr.h"
+ #include "../../lib/util/memcache.h"
+-#include <time.h>
++#include "../../lib/pthreadpool/pthreadpool_pipe.h"
++#include <sys/syscall.h>
+ 
+ #undef DBGC_CLASS
+ #define DBGC_CLASS DBGC_VFS
+@@ -78,6 +80,7 @@ static struct ceph_mount_info * cmount =
+ static uint32_t cmount_cnt = 0;
+ 
+ 
++
+ #ifdef HAVE_CEPH_STATX
+ 
+ /*
+@@ -446,8 +449,10 @@ static int cephwrap_open(struct vfs_hand
+ 			struct smb_filename *smb_fname,
+ 			files_struct *fsp, int flags, mode_t mode)
+ {
++
+ 	int result = -ENOENT;
+-	DBG_DEBUG("[CEPH] open(%p, %s, %p, %d, %d)\n", handle,
++
++	DBG_INFO("[CEPH] sync open(%p, %s, %p, %d, %d)\n", handle,
+ 		  smb_fname_str_dbg(smb_fname), fsp, flags, mode);
+ 
+ 	if (smb_fname->stream_name) {
+@@ -460,14 +465,482 @@ out:
+ 	WRAP_RETURN(result);
+ }
+ 
++
++struct aio_open_private_data {
++	struct aio_open_private_data *prev, *next;
++	/* Inputs. */
++	struct vfs_handle_struct *handle;
++	int jobid;
++	int dir_fd;
++	int flags;
++	mode_t mode;
++	uint64_t mid;
++	bool in_progress;
++	const char *fname;
++	char *dname;
++	struct smbd_server_connection *sconn;
++	const struct security_unix_token *ux_tok;
++	/* Returns. */
++	int ret_fd;
++	int ret_errno;
++};
++
++struct defered_close_private_data {
++	struct defered_close_private_data *prev, *next;
++	int fd;
++	char * filename;
++        struct tevent_timer *close_event;
++	struct smbd_server_connection *sconn;
++};
++
++static struct pthreadpool_pipe *open_pool;
++static int aio_pthread_open_jobid; 
++static struct aio_open_private_data *open_pd_list;
++static struct defered_close_private_data *defered_close_list = NULL;
++
++static bool init_aio_threadpool(struct tevent_context *ev_ctx,
++                struct pthreadpool_pipe **pp_pool,
++                void (*completion_fn)(struct tevent_context *,
++                        struct tevent_fd *,
++                        uint16_t,
++                        void *))
++{
++    struct tevent_fd *sock_event = NULL;
++    int ret = 0;
++
++    if (*pp_pool) {
++        return true;
++    }
++
++    ret = pthreadpool_pipe_init(lp_aio_max_threads(), pp_pool);
++    if (ret) {
++        errno = ret;
++        return false;
++    }
++    sock_event = tevent_add_fd(ev_ctx,
++                NULL,
++                pthreadpool_pipe_signal_fd(*pp_pool),
++                TEVENT_FD_READ,
++                completion_fn,
++                NULL);
++    if (sock_event == NULL) {
++        pthreadpool_pipe_destroy(*pp_pool);
++        *pp_pool = NULL;
++        return false;
++    }
++
++    DEBUG(10,("[CEPH]init_aio_threadpool: initialized with up to %d threads\n",
++          (int)lp_aio_max_threads()));
++
++    return true;
++}
++
++static struct aio_open_private_data * find_open_private_data_by_jobid(int jobid)
++{
++    struct aio_open_private_data *opd;
++
++    for (opd = open_pd_list; opd != NULL; opd = opd->next) {
++        if (opd->jobid == jobid) {
++            return opd;
++        }
++    }
++
++    return NULL;
++}
++
++static struct aio_open_private_data *find_open_private_data_by_mid(uint64_t mid)
++{
++    struct aio_open_private_data *opd;
++
++    for (opd = open_pd_list; opd != NULL; opd = opd->next) {
++        if (opd->mid == mid) {
++            return opd;
++        }
++    }
++
++    return NULL;
++}
++
++
++static bool find_completed_open(files_struct *fsp,
++                int *p_fd,
++                int *p_errno)
++{
++
++	struct aio_open_private_data *opd = NULL;
++
++	opd = find_open_private_data_by_mid(fsp->mid);
++	if (!opd) {
++		return false;
++	}
++
++	if (opd->in_progress) {
++		DBG_DEBUG("[CEPH] find_completed_open: mid %llu "
++					"jobid %d still in progress for "
++					"file %s. PANIC !\n",
++					(unsigned long long)opd->mid,
++					opd->jobid,
++					opd->fname);
++		/* Disaster ! This is an open timeout. Just panic. */
++		smb_panic("find_completed_open - in_progress\n");
++		/* notreached. */
++		return false;
++	}
++
++	*p_fd = opd->ret_fd;
++	*p_errno = opd->ret_errno;
++	
++	TALLOC_FREE(opd);
++	return true;
++}
++
++static int opd_destructor(struct aio_open_private_data *opd)
++{
++    DLIST_REMOVE(open_pd_list, opd);
++    return 0;
++}
++
++static struct aio_open_private_data *create_private_open_data(const files_struct *fsp,
++                    int flags,
++                    mode_t mode,
++			const char* fname
++)
++{
++    struct aio_open_private_data *opd = talloc_zero(NULL,
++                    struct aio_open_private_data);
++
++    if (!opd) {
++        return NULL;
++    }
++
++    opd->jobid = aio_pthread_open_jobid++;
++    opd->ret_fd = -1;
++    opd->ret_errno = EINPROGRESS;
++    opd->flags = flags;
++    opd->mode = mode;
++    opd->mid = fsp->mid;
++    opd->in_progress = true;
++    opd->sconn = fsp->conn->sconn;
++
++    /* Copy our current credentials. */
++    opd->ux_tok = copy_unix_token(opd, get_current_utok(fsp->conn));
++    if (opd->ux_tok == NULL) {
++        TALLOC_FREE(opd);
++        return NULL;
++    }
++
++    opd->fname = talloc_strdup(opd, fname);
++    if (opd->fname == NULL) {
++        TALLOC_FREE(opd);
++        return NULL;
++    }
++
++    talloc_set_destructor(opd, opd_destructor);
++    DLIST_ADD_END(open_pd_list, opd);
++    return opd;
++}
++
++static void aio_open_worker(void *private_data)
++{
++    struct aio_open_private_data *opd =
++        (struct aio_open_private_data *)private_data;
++
++    /* Become the correct credential on this thread. */
++    if (set_thread_credentials(opd->ux_tok->uid,
++                opd->ux_tok->gid,
++                (size_t)opd->ux_tok->ngroups,
++                opd->ux_tok->groups) != 0) {
++        opd->ret_fd = -1;
++        opd->ret_errno = errno;
++        return;
++    }
++
++    /*
++    * This vfs_ceph module has a bug, it only support one cephfs
++    * It will only use on cmount
++    */
++    opd->ret_fd = ceph_open(cmount, opd->fname, opd->flags, opd->mode);
++    DBG_NOTICE("[CEPH] aio_worker [pid:%ld]: ceph_open %s, returns fd:%d\n", syscall(SYS_gettid), opd->fname, opd->ret_fd);
++
++    if (opd->ret_fd < 0)
++        opd->ret_errno = errno;
++    else
++        /* Create was successful. */
++        opd->ret_errno = 0;
++}
++
++static void aio_open_handle_completion(struct tevent_context *event_ctx,
++                struct tevent_fd *event,
++                uint16_t flags,
++                void *p)
++
++{
++    struct aio_open_private_data *opd = NULL;
++    int jobid = 0;
++    int ret;
++    struct smbXsrv_connection *xconn;
++
++    DEBUG(3, ("[CEPH] aio_open_handle_completion called with flags=%d\n",
++        (int)flags));
++    
++    if ((flags & TEVENT_FD_READ) == 0) {
++        return;
++    }
++
++    ret = pthreadpool_pipe_finished_jobs(open_pool, &jobid, 1);
++    if (ret != 1) {
++        smb_panic("aio_open_handle_completion");
++        /* notreached. */
++        return;
++    }
++
++    opd = find_open_private_data_by_jobid(jobid);
++    if (opd == NULL) {
++        DEBUG(0, ("aio_open_handle_completion cannot find jobid %d\n",
++            jobid));
++        smb_panic("aio_open_handle_completion - no jobid");
++        /* notreached. */
++        return;
++    }
++    DEBUG(3,("[CEPH] aio_open_handle_completion: jobid %d mid %llu "
++        "for file %s completed\n",
++        jobid,
++        (unsigned long long)opd->mid,
++        opd->fname));
++
++    opd->in_progress = false;
++
++    /*
++     * TODO: In future we need a proper algorithm
++     * to find the correct connection for a fsp.
++     * For now we only have one connection, so this is correct...
++     */
++    xconn = opd->sconn->client->connections;
++
++    /* Find outstanding event and reschedule. */
++    if (!schedule_deferred_open_message_smb(xconn, opd->mid)) {
++        /*
++         * Outstanding event didn't exist or was
++         * cancelled. Free up the fd and throw
++         * away the result.
++         */
++        DBG_NOTICE("can not RESCHEDULE.\n");
++        if (opd->ret_fd != -1) {
++            close(opd->ret_fd);
++            opd->ret_fd = -1;
++        }
++        TALLOC_FREE(opd);
++    }
++
++}
++
++static int create_async(const files_struct *fsp,
++            int flags,
++            mode_t mode, const char * fname)
++{
++
++
++	struct aio_open_private_data *opd = NULL;	
++        int ret;
++
++        if (!init_aio_threadpool(fsp->conn->sconn->ev_ctx,
++            &open_pool,
++            aio_open_handle_completion)) {
++            return -1;
++    	}
++
++	opd = create_private_open_data(fsp, flags, mode, fname);
++	if (opd == NULL) {
++		DEBUG(5, ("[CEPH] create_async: Could not create private data.\n"));
++		return -1;
++	}
++
++	ret = pthreadpool_pipe_add_job(open_pool,
++			opd->jobid,
++			aio_open_worker,
++			(void *)opd);
++	if (ret) {
++		errno = ret;
++		return -1;
++        }
++
++        DEBUG(5,("create_async: mid %llu jobid %d created for file %s, flags: %d\n",
++        (unsigned long long)opd->mid,
++        opd->jobid,
++        opd->fname,
++	flags
++	));
++
++	errno = EINTR; /* Maps to NT_STATUS_RETRY. IMPORTANT:open.c will call open later*/
++	return -1;
++} 
++
++
++static int find_reusable_defered_fd(struct smb_filename *smb_fname) {
++
++	int ret = -1;
++	struct defered_close_private_data * p = NULL;
++	const char * path = ceph_getcwd(cmount);
++	char * absolute_filename = talloc_asprintf(NULL, "%s/%s", path, smb_fname->base_name);
++
++	DBG_NOTICE("[CEPH] try to find usabled defered fd for %s\n", absolute_filename);
++	for(p = defered_close_list; p != NULL ; p = p->next) {
++		if(strcmp(absolute_filename, p->filename) == 0) {
++			DBG_NOTICE("[CEPH] FOUND FD for %s", absolute_filename);
++			ret = p->fd;
++			TALLOC_FREE(p);
++			break;
++		}
++	}
++	TALLOC_FREE(absolute_filename);
++	return ret;
++}
++
++static int cephwrap_aio_open(struct vfs_handle_struct *handle,
++				struct smb_filename *smb_fname,
++				files_struct *fsp, int flags, mode_t mode)
++{
++	int my_errno = 0;
++	int fd = -1;
++	int ret;
++
++	if (smb_fname->stream_name) {
++		/* Don't handle stream opens. */
++		errno = ENOENT;
++		return -1;
++	}
++
++	bool aio_allow_open = lp_parm_bool(
++			SNUM(handle->conn), "ceph", "aio", true);
++
++	bool defered_close = lp_parm_bool(
++			SNUM(handle->conn), "ceph", "defered close", false);
++
++	if (!aio_allow_open) {
++		return cephwrap_open(handle, smb_fname, fsp, flags, mode);
++	}
++
++
++	// defered_close and RDONLY and fname is not "." , try to reuse first;
++	// ignore mode and flags
++	if ( defered_close && ((flags & 003) == O_RDONLY) && (strcmp(smb_fname->base_name, ".") !=0) ){
++		int fd = find_reusable_defered_fd(smb_fname);
++		if ( fd > 0)  {
++			DBG_NOTICE("[CEPH] found usesable file for %s; fd is %d", smb_fname->base_name, fd);
++			return fd;
++		}
++	}
++	
++	if (!(flags & O_CREAT)) {
++		return cephwrap_open(handle, smb_fname, fsp, flags, mode);
++	}
++
++	if (find_completed_open(fsp,
++				&fd,
++				&my_errno)) {
++		errno = my_errno;
++		return fd;
++	}
++	
++	const char * path = ceph_getcwd(cmount);
++	char * absolute_path = talloc_asprintf(NULL, "%s/%s", path, smb_fname->base_name);
++	ret = create_async(fsp, flags, mode, absolute_path);
++	TALLOC_FREE(absolute_path);
++	return ret;
++
++}
++				
++
++
++static struct defered_close_private_data *  create_defered_close_data(const struct files_struct *fsp) {
++
++	struct defered_close_private_data * dpd = talloc_zero(NULL, 
++							struct defered_close_private_data);
++
++	const char * path = ceph_getcwd(cmount);
++        char * absolute_path = talloc_asprintf(dpd, "%s/%s", path, fsp->fsp_name->base_name);
++
++	dpd->filename = absolute_path;
++	dpd->fd = fsp->fh->fd;
++	dpd->sconn = fsp->conn->sconn;
++	return dpd;
++}
++
++
++static void real_close_fd_after_timeout(struct tevent_context *ev, struct tevent_timer *tim,
++                     struct timeval current_time, void *private_data) 
++{
++	struct defered_close_private_data *dpd = talloc_get_type_abort(private_data, struct defered_close_private_data);
++
++	if (dpd==NULL)
++		return;
++
++/*
++	if (dpd->close_event)
++		TALLOC_FREE(dpd->close_event);
++*/
++	int ret = ceph_close(cmount, dpd->fd);
++	if (ret < 0) {
++		DBG_ERR("[CEPH] real close fd: %d, filename: %s\n, error:%s", dpd->fd, dpd->filename, strerror(-ret));
++		TALLOC_FREE(dpd);
++		return;
++	}
++
++	DBG_NOTICE("[CEPH] real close fd: %d,filename: %s\n", dpd->fd, dpd->filename);
++	TALLOC_FREE(dpd);
++}
++
++static void dpd_destructor(struct defered_close_private_data *dpd)
++{
++    DLIST_REMOVE(defered_close_list, dpd);
++}
++
+ static int cephwrap_close(struct vfs_handle_struct *handle, files_struct *fsp)
+ {
+ 	int result;
++	bool defered_close = lp_parm_bool(
++			SNUM(handle->conn), "ceph", "defered close", false);
+ 
++
++	if (defered_close && fsp->can_read) {
++
++		struct defered_close_private_data *dpd = create_defered_close_data(fsp);
++		if (dpd == NULL) {
++			DBG_NOTICE("[CEPH] failed to alloc defered_close_private_data");
++			return -1;
++		}
++
++		DBG_NOTICE("[CEPH] is file can readable? %d\n", fsp->can_read);
++
++		//find the duplidated filename
++		struct defered_close_private_data * p = defered_close_list;
++		for(;p != NULL; p = p->next ) {
++			DBG_NOTICE("[CEPH] %s == %s \n", dpd->filename, p->filename);
++			if (strcmp(dpd->filename, p->filename) == 0) {
++				goto NORMAL_CLOSE;
++			}
++		}
++		
++		DBG_NOTICE("[CEPH] defer the close\n");
++		dpd->close_event = tevent_add_timer(server_event_context(), dpd, 
++					tevent_timeval_current_ofs(2, 0), /*2 seconds later, close the fd*/
++					real_close_fd_after_timeout, 
++					dpd);
++
++		talloc_set_destructor(dpd, dpd_destructor);
++		DLIST_ADD_END(defered_close_list, dpd);
++		
++		//cheat the close is finished
++		errno = 0;
++		return 0;
++		
++	}
++
++NORMAL_CLOSE:
+ 	DBG_DEBUG("[CEPH] close(%p, %p)\n", handle, fsp);
++	
+ 	result = ceph_close(handle->data, fsp->fh->fd);
+ 	DBG_DEBUG("[CEPH] close(...) = %d\n", result);
+-
+ 	WRAP_RETURN(result);
+ }
+ 
+@@ -609,20 +1082,24 @@ static void init_stat_ex_from_ceph_statx
+ 	dst->st_ex_blocks = stx->stx_blocks;
+ }
+ 
+-//
++//TODO use union
+ struct extended_ceph_statx {
+ 	struct ceph_statx stx;
+ 	time_t when_cached;
+ };
+ 
++
+ static int do_ceph_statx(struct ceph_mount_info * cmount, char * path, struct ceph_statx *stx, unsigned int want, unsigned int flags)
+ {
+ 	DBG_DEBUG("[CEPH CACHE] stat(%s)\n", path);
+ 
++	char * absolute_path = talloc_asprintf(NULL, "%s/%s", ceph_getcwd(cmount), path);
++
+ 	DATA_BLOB key, value;
+ 	struct extended_ceph_statx * extended_value;
+ 	int result;
+-	key = data_blob_const(path, strlen(path));
++	key = data_blob_const(absolute_path, strlen(absolute_path));
++
+ 	if(!memcache_lookup(ceph_statx_cache, STAT_CACHE, key, &value)) {
+ 		goto real_statx;
+ 	} else {
+@@ -632,26 +1109,26 @@ static int do_ceph_statx(struct ceph_mou
+ 		//check time 
+ 		////Time is not invalid
+ 		if ((time_mono(NULL) - extended_value->when_cached) > EXPIRE_TIME) {
+-			DBG_DEBUG("[CEPH CACHE] invalid cache for (%s)\n", path);
++			DBG_DEBUG("[CEPH CACHE] invalid cache for (%s)\n", absolute_path);
+ 			memcache_delete(ceph_statx_cache, STAT_CACHE, key);
+ 			goto real_statx;
+ 		} else {
+-			DBG_DEBUG("[CEPH CACHE] got cache for (%s)\n", path);
++			DBG_DEBUG("[CEPH CACHE] got cache for (%s)\n", absolute_path);
+ 			memcpy(stx, &extended_value->stx, sizeof(struct ceph_statx));
++			TALLOC_FREE(absolute_path);
+ 			return 0;
+ 		}	
+-		//DBG_DEBUG("[CEPH CACHE] got cache for (%s)\n", path);
+-		//memcpy(stx, &extended_value->stx, sizeof(struct ceph_statx));
+ 	}
+ 
+ real_statx:
+-	DBG_DEBUG("[CEPH CACHE] real stat(%s)\n", path);
++	DBG_DEBUG("[CEPH CACHE] real stat path(%s)\n", path);
+ 	result = ceph_statx(cmount, path, stx, want, flags);
+ 	if (result < 0) {
++		TALLOC_FREE(absolute_path);
+ 		return result;
+ 	} else {
+ 		if (S_ISDIR(stx->stx_mode)) {
+-			DBG_DEBUG("[CEPH CACHE] put into cache (%s)\n", path);
++			DBG_DEBUG("[CEPH CACHE] put into cache absolute path(%s)\n", absolute_path);
+ 			struct extended_ceph_statx new_value;
+ 			memcpy(&new_value.stx, stx, sizeof(struct ceph_statx));
+ 			new_value.when_cached = time_mono(NULL);
+@@ -659,6 +1136,7 @@ real_statx:
+ 			memcache_add(ceph_statx_cache, STAT_CACHE, key, v);
+ 		}
+ 	}
++	TALLOC_FREE(absolute_path);
+ 	return result;
+ }
+ 
+@@ -1321,16 +1799,9 @@ static int cephwrap_get_real_filename(st
+ 				     TALLOC_CTX *mem_ctx,
+ 				     char **found_name)
+ {
+-	*found_name = talloc_strdup(mem_ctx, name);
+-/*
+-	if (strlen(path) == 0) {
+-		*found_name = talloc_strdup(mem_ctx, name);
+-	} else {
+-		*found_name = talloc_asprintf(mem_ctx, "%s/%s", path, name);
+-	}
+-*/
+-	DBG_DEBUG("[CEPH CACHE] input path (%s) name (%s): (%s)\n", path, name, *found_name);
+-        return 0;
++     *found_name = talloc_strdup(mem_ctx, name);
++     DBG_DEBUG("[CEPH CACHE] real filename input path (%s) name (%s): (%s)\n", path, name, *found_name);
++     return 0;
+ }
+ 
+ static const char *cephwrap_connectpath(struct vfs_handle_struct *handle,
+@@ -1504,7 +1975,7 @@ static struct vfs_fn_pointers ceph_fns =
+ 
+ 	/* File operations */
+ 
+-	.open_fn = cephwrap_open,
++	.open_fn = cephwrap_aio_open,
+ 	.close_fn = cephwrap_close,
+ 	.read_fn = cephwrap_read,
+ 	.pread_fn = cephwrap_pread,
+@@ -1567,6 +2038,7 @@ static struct vfs_fn_pointers ceph_fns =
+ NTSTATUS vfs_ceph_init(TALLOC_CTX *);
+ NTSTATUS vfs_ceph_init(TALLOC_CTX *ctx)
+ {
++	//talloc_disable_null_tracking();
+ 	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
+ 				"ceph", &ceph_fns);
+ }

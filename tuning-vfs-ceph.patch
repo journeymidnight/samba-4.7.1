@@ -1,0 +1,159 @@
+Index: samba-4.6.2/source3/modules/vfs_ceph.c
+===================================================================
+--- samba-4.6.2.orig/source3/modules/vfs_ceph.c
++++ samba-4.6.2/source3/modules/vfs_ceph.c
+@@ -37,6 +37,8 @@
+ #include "cephfs/libcephfs.h"
+ #include "smbprofile.h"
+ #include "modules/posixacl_xattr.h"
++#include "../../lib/util/memcache.h"
++#include <time.h>
+ 
+ #undef DBGC_CLASS
+ #define DBGC_CLASS DBGC_VFS
+@@ -75,6 +77,24 @@
+ static struct ceph_mount_info * cmount = NULL;
+ static uint32_t cmount_cnt = 0;
+ 
++
++#ifdef HAVE_CEPH_STATX
++
++/*
++ *  When statx, lookup cache, if exists and time is valid, return the result.
++ *  if the time is not valid, delete the entry, run real statx,
++ *  else return cached data;
++ *  if not exists, run real statx.
++ *
++ *  After we can get result of statx, 
++ *  if exists and is a directory. Cache it, and return.
++ *  else return
++ *
++ */
++struct memcache * ceph_statx_cache;
++#define EXPIRE_TIME  10 /* 10 seconds to expire */
++#endif
++
+ /* Check for NULL pointer parameters in cephwrap_* functions */
+ 
+ /* We don't want to have NULL function pointers lying around.  Someone
+@@ -125,6 +145,14 @@ static int cephwrap_connect(struct vfs_h
+ 		goto err_out;
+ 
+ 
++	#ifdef HAVE_CEPH_STATX
++	ceph_statx_cache = memcache_init(0, 16 << 10);
++	if (ceph_statx_cache == NULL) {
++		DBG_DEBUG("[CEPH] failed to create memcache for ceph stats");
++		ret = -10;
++		goto err_out;
++	}
++	#endif
+ 	/*
+ 	 * encode mount context/state into our vfs/connection holding structure
+ 	 * cmount is a ceph_mount_t*
+@@ -562,6 +590,62 @@ static void init_stat_ex_from_ceph_statx
+ 	dst->st_ex_blocks = stx->stx_blocks;
+ }
+ 
++//
++struct extended_ceph_statx {
++	struct ceph_statx stx;
++	time_t when_cached;
++};
++
++static int do_ceph_statx(struct ceph_mount_info * cmount, char * path, struct ceph_statx *stx, unsigned int want, unsigned int flags)
++{
++	DBG_DEBUG("[CEPH CACHE] stat(%s)\n", path);
++
++	DATA_BLOB key, value;
++	struct extended_ceph_statx * extended_value;
++	int result;
++	key = data_blob_const(path, strlen(path));
++	if(!memcache_lookup(ceph_statx_cache, STAT_CACHE, key, &value)) {
++		goto real_statx;
++	} else {
++		//extract value
++		extended_value = (struct extended_ceph_statx *)(value.data);
++		
++		//check time 
++		////Time is not invalid
++		if ((time_mono(NULL) - extended_value->when_cached) > EXPIRE_TIME) {
++			DBG_DEBUG("[CEPH CACHE] invalid cache for (%s)\n", path);
++			memcache_delete(ceph_statx_cache, STAT_CACHE, key);
++			goto real_statx;
++		} else {
++			DBG_DEBUG("[CEPH CACHE] got cache for (%s)\n", path);
++			memcpy(stx, &extended_value->stx, sizeof(struct ceph_statx));
++			return 0;
++		}	
++		//DBG_DEBUG("[CEPH CACHE] got cache for (%s)\n", path);
++		//memcpy(stx, &extended_value->stx, sizeof(struct ceph_statx));
++	}
++
++real_statx:
++	DBG_DEBUG("[CEPH CACHE] real stat(%s)\n", path);
++	result = ceph_statx(cmount, path, stx, want, flags);
++	if (result < 0) {
++		return result;
++	} else {
++		if (S_ISDIR(stx->stx_mode)) {
++			DBG_DEBUG("[CEPH CACHE] put into cache (%s)\n", path);
++			struct extended_ceph_statx new_value;
++			memcpy(&new_value.stx, stx, sizeof(struct ceph_statx));
++			new_value.when_cached = time_mono(NULL);
++			DATA_BLOB v = data_blob_const(&new_value, sizeof(struct extended_ceph_statx));
++			memcache_add(ceph_statx_cache, STAT_CACHE, key, v);
++		}
++	}
++	return result;
++}
++
++
++
++
+ static int cephwrap_stat(struct vfs_handle_struct *handle,
+ 			struct smb_filename *smb_fname)
+ {
+@@ -575,7 +659,8 @@ static int cephwrap_stat(struct vfs_hand
+ 		return result;
+ 	}
+ 
+-	result = ceph_statx(handle->data, smb_fname->base_name, &stx,
++	//FUCK
++	result = do_ceph_statx(handle->data, smb_fname->base_name, &stx,
+ 				SAMBA_STATX_ATTR_MASK, 0);
+ 	DBG_DEBUG("[CEPH] statx(...) = %d\n", result);
+ 	if (result < 0) {
+@@ -634,7 +719,8 @@ static int cephwrap_lstat(struct vfs_han
+ 		return result;
+ 	}
+ 
+-	result = ceph_statx(handle->data, smb_fname->base_name, &stx,
++	//FUCK
++	result = do_ceph_statx(handle->data, smb_fname->base_name, &stx,
+ 				SAMBA_STATX_ATTR_MASK, AT_SYMLINK_NOFOLLOW);
+ 	DBG_DEBUG("[CEPH] lstat(...) = %d\n", result);
+ 	if (result < 0) {
+@@ -1187,12 +1273,16 @@ static int cephwrap_get_real_filename(st
+ 				     TALLOC_CTX *mem_ctx,
+ 				     char **found_name)
+ {
+-	/*
+-	 * Don't fall back to get_real_filename so callers can differentiate
+-	 * between a full directory scan and an actual case-insensitive stat.
+-	 */
+-	errno = EOPNOTSUPP;
+-	return -1;
++	*found_name = talloc_strdup(mem_ctx, name);
++/*
++	if (strlen(path) == 0) {
++		*found_name = talloc_strdup(mem_ctx, name);
++	} else {
++		*found_name = talloc_asprintf(mem_ctx, "%s/%s", path, name);
++	}
++*/
++	DBG_DEBUG("[CEPH CACHE] input path (%s) name (%s): (%s)\n", path, name, *found_name);
++        return 0;
+ }
+ 
+ static const char *cephwrap_connectpath(struct vfs_handle_struct *handle,
