@@ -1,0 +1,32 @@
+Index: samba-4.7.1/source3/modules/vfs_ceph.c
+===================================================================
+--- samba-4.7.1.orig/source3/modules/vfs_ceph.c
++++ samba-4.7.1/source3/modules/vfs_ceph.c
+@@ -1093,7 +1093,26 @@ static int do_ceph_statx(struct ceph_mou
+ {
+ 	DBG_DEBUG("[CEPH CACHE] stat(%s)\n", path);
+ 
+-	char * absolute_path = talloc_asprintf(NULL, "%s/%s", ceph_getcwd(cmount), path);
++	char * absolute_path = NULL;
++
++	//current directory
++	if ((strcmp(path, ".") == 0) || (strcmp(path, "./") == 0)) {
++		absolute_path = talloc_asprintf(NULL, "%s/", ceph_getcwd(cmount));
++	} else if (path[0] == '/') {
++		//absolute directory or normal files
++		if (path[strlen(path)-1] == '/')
++			absolute_path = talloc_asprintf(NULL, "%s", path);
++		else
++			absolute_path = talloc_asprintf(NULL, "%s/", path);
++	//normal files or direcory name without prefix
++	} else {
++		if(strncmp("./", path, 2) == 0) {
++			//if direcory name starts with "./", trim it
++			absolute_path = talloc_asprintf(NULL, "%s/%s/", ceph_getcwd(cmount), path + 2);
++		} else {
++			absolute_path = talloc_asprintf(NULL, "%s/%s/", ceph_getcwd(cmount), path);
++		}
++	}
+ 
+ 	DATA_BLOB key, value;
+ 	struct extended_ceph_statx * extended_value;
