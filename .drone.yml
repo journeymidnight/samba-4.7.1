@@ -1,7 +1,8 @@
+clone:
+  git:
+    image: envelopecity/drone-git-lfs
+
 pipeline:
-  clone:
-    git:
-      image: envelopecity/drone-git-lfs
   build:
     image: centos:7.4.1708
     commands:
