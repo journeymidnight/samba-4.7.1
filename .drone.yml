@@ -3,7 +3,7 @@ pipeline:
     image: centos:7.4.1708
     commands:
       - yum install -y rpm-build make yum-utils epel-release
-      - yum-builddep samba
+      - yum-builddep -y samba
       - ./localbuild -bb samba.spec
   github_release:
     image: plugins/github-release
