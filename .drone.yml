@@ -19,3 +19,23 @@ pipeline:
     secrets: [github_token]
     when:
        event: [tag]
+  s3:
+    image: plugins/s3
+    bucket: jmdrepo
+    source: "*.tar.gz"
+    secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
+    path_style: false
+    acl: public-read
+    endpoint: https://oss-cn-beijing.aliyuncs.com
+    when:
+       event: [tag]
+
+  pushbear:
+    image: thesues/drone-pushbear
+    url: XXXX
+    secrets: [sendkey]
+    when:
+      event: [tag, push]
+      success: false
+      failure: false
+      change: true
