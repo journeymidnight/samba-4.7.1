@@ -10,6 +10,8 @@ pipeline:
       - yum install -y gcc rpm-build make yum-utils epel-release glusterfs-api-devel glusterfs-devel libcephfs-devel
       - yum-builddep -y samba
       - ./localbuild -bb samba.spec
+    when:
+       event: [tag]
   github_release:
     image: plugins/github-release
     files:
