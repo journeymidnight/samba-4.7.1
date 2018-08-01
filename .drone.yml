@@ -10,6 +10,7 @@ pipeline:
       - yum install -y gcc rpm-build make yum-utils epel-release glusterfs-api-devel glusterfs-devel libcephfs-devel
       - yum-builddep -y samba
       - ./localbuild -bb samba.spec
+      - cp /root/rpmbuild/RPMS/x86_64/*.rpm /root/rpmbuild/RPMS/noarch/*.rpm .
     when:
        event: [tag]
   github_release:
@@ -24,7 +25,7 @@ pipeline:
   s3:
     image: plugins/s3
     bucket: jmdrepo
-    source: "*.tar.gz"
+    source: "*.rpm"
     secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
     path_style: false
     acl: public-read
