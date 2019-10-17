@@ -6,7 +6,7 @@
 # ctdb is enabled by default, you can disable it with: --without clustering
 %bcond_without clustering
 
-%define main_release 1026
+%define main_release 1027
 
 %define samba_version 4.7.1
 %define talloc_version 2.1.9
@@ -130,6 +130,7 @@ Patch7:   samba-4.7-fix_smb2_client_read_after_free.patch
 Patch8:   tuning-vfs-ceph.patch
 Patch9:   tuning-vfs-ceph-stage3.patch
 Patch10:  tuning-ceph-make-statcache-compact.patch
+Patch11:  lttng-module.patch
 
 Requires(pre): /usr/sbin/groupadd
 Requires(post): systemd
@@ -1814,6 +1815,7 @@ rm -rf %{buildroot}
 %if %{with_vfs_cephfs}
 %files vfs-cephfs
 %{_libdir}/samba/vfs/ceph.so
+%{_libdir}/samba/vfs/lttng.so
 %{_mandir}/man8/vfs_ceph.8*
 %endif
 
