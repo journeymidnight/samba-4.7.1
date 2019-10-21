@@ -6,7 +6,7 @@
 # ctdb is enabled by default, you can disable it with: --without clustering
 %bcond_without clustering
 
-%define main_release 1027
+%define main_release 1028
 
 %define samba_version 4.7.1
 %define talloc_version 2.1.9

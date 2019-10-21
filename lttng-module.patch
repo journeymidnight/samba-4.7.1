@@ -21,7 +21,7 @@ Index: samba-4.7.1/source3/modules/vfs_lttng.c
 ===================================================================
 --- /dev/null
 +++ samba-4.7.1/source3/modules/vfs_lttng.c
-@@ -0,0 +1,1520 @@
+@@ -0,0 +1,1529 @@
 +/*
 +
 + * Lttng VFS module for samba. Trace VFS functions using lttng userspace 
@@ -434,7 +434,15 @@ Index: samba-4.7.1/source3/modules/vfs_lttng.c
 +        return result;
 +}
 +
++static int vfs_lttng_fsync(vfs_handle_struct *handle, files_struct *fsp)
 +
++{
++        int result;
++        tracepoint(vfs_lttng, vfs_lttng_fsync_enter , fsp);
++        result = SMB_VFS_NEXT_FSYNC(handle, fsp);
++        tracepoint(vfs_lttng, vfs_lttng_fsync_exit, result);
++        return result;
++}
 +
 +
 +static int vfs_lttng_stat(vfs_handle_struct *handle,
@@ -1461,6 +1469,7 @@ Index: samba-4.7.1/source3/modules/vfs_lttng.c
 +        .sendfile_fn = vfs_lttng_sendfile,
 +        .recvfile_fn = vfs_lttng_recvfile,
 +        .rename_fn = vfs_lttng_rename,
++	.fsync_fn = vfs_lttng_fsync,
 +        .stat_fn = vfs_lttng_stat,
 +        .fstat_fn = vfs_lttng_fstat,
 +        .lstat_fn = vfs_lttng_lstat,
@@ -1546,7 +1555,7 @@ Index: samba-4.7.1/source3/modules/vfs_lttng_tp.h
 ===================================================================
 --- /dev/null
 +++ samba-4.7.1/source3/modules/vfs_lttng_tp.h
-@@ -0,0 +1,2321 @@
+@@ -0,0 +1,2344 @@
 +/*
 +
 + * LTTNG VFS module for samba. Trace VFS functions using lttng
@@ -2190,6 +2199,29 @@ Index: samba-4.7.1/source3/modules/vfs_lttng_tp.h
 +    )
 +)
 +/* vfs_lttng_rename END*/
++
++/* vfs_lttng_fsync START*/
++TRACEPOINT_EVENT(
++    vfs_lttng,
++    vfs_lttng_fsync_enter,
++    TP_ARGS(
++        files_struct *, fsp
++    ),
++    TP_FIELDS(
++        ctf_string(filename, fsp->fsp_name->base_name)
++    )
++)
++TRACEPOINT_EVENT(
++    vfs_lttng,
++    vfs_lttng_fsync_exit,
++    TP_ARGS(
++        int, result
++    ),
++    TP_FIELDS(
++        ctf_integer(int, retval, result)
++    )
++)
++/* vfs_lttng_fsync END*/
 +
 +/* vfs_lttng_stat START*/
 +TRACEPOINT_EVENT(
